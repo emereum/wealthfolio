@@ -7,12 +7,14 @@
 
 mod models;
 
+use std::collections::BTreeMap;
 use std::sync::RwLock;
 use std::time::Duration;
 
 use crate::SymbolResolver;
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
+use chrono_tz::Tz;
 use lazy_static::lazy_static;
 use log::{debug, warn};
 use num_traits::FromPrimitive;
@@ -25,11 +27,13 @@ use yahoo_finance_api as yahoo;
 
 use crate::errors::MarketDataError;
 use crate::models::{
-    to_iso_alpha2, AssetProfile, Coverage, DividendEvent, InstrumentKind, ProviderInstrument,
-    Quote, QuoteContext, SearchResult, SplitEvent,
+    to_iso_alpha2, AssetProfile, Coverage, DividendEvent, InstrumentId, InstrumentKind,
+    ProviderInstrument, Quote, QuoteContext, SearchResult, SplitEvent,
 };
 use crate::provider::{MarketDataProvider, ProviderCapabilities, RateLimit};
-use crate::resolver::{yahoo_equity_search_queries, yahoo_exchange_to_mic, ResolverChain};
+use crate::resolver::{
+    mic_to_timezone, yahoo_equity_search_queries, yahoo_exchange_to_mic, ResolverChain,
+};
 
 use models::{
     YahooPriceDetail, YahooQuoteSummaryResponse, YahooQuoteSummaryResult, YahooTopHoldings,
@@ -400,11 +404,53 @@ impl YahooProvider {
             .unwrap_or_else(|_| OffsetDateTime::now_utc())
     }
 
+    /// Timezone of the instrument's exchange. Instruments without a MIC, such as
+    /// crypto and FX, have none and keep their UTC days.
+    fn exchange_timezone(context: &QuoteContext) -> Option<Tz> {
+        let InstrumentId::Equity { mic: Some(mic), .. } = &context.instrument else {
+            return None;
+        };
+        mic_to_timezone(mic)?.parse().ok()
+    }
+
+    /// Move a timestamp into the UTC day that matches its exchange-local date.
+    ///
+    /// Quote days are read from the timestamp's UTC date, but Yahoo stamps daily bars
+    /// at the session open, which is the previous UTC day for exchanges such as the
+    /// ASX. Timestamps already on the right day keep their time, so a live quote still
+    /// sorts after that day's bar.
+    fn to_exchange_day(timestamp: DateTime<Utc>, timezone: Tz) -> DateTime<Utc> {
+        let local_date = timestamp.with_timezone(&timezone).date_naive();
+        let day_start = local_date
+            .and_hms_opt(0, 0, 0)
+            .expect("00:00:00 is a valid time")
+            .and_utc();
+        let day_end = local_date
+            .and_hms_opt(23, 59, 59)
+            .expect("23:59:59 is a valid time")
+            .and_utc();
+        timestamp.clamp(day_start, day_end)
+    }
+
+    /// Keep the last quote for each UTC day, in date order.
+    ///
+    /// Yahoo can return a day's bar and a live row for the same session. Both fall on one
+    /// day, and a history reset inserts rows under a unique asset, day and source.
+    fn keep_last_quote_per_day(quotes: Vec<Quote>) -> Vec<Quote> {
+        quotes
+            .into_iter()
+            .map(|quote| (quote.timestamp.date_naive(), quote))
+            .collect::<BTreeMap<_, _>>()
+            .into_values()
+            .collect()
+    }
+
     /// Convert a Yahoo quote to our Quote model.
     fn yahoo_quote_to_quote(
         &self,
         yahoo_quote: yahoo::Quote,
         currency: String,
+        exchange_timezone: Option<Tz>,
     ) -> Result<Quote, MarketDataError> {
         // Validate timestamp
         let timestamp: DateTime<Utc> = Utc
@@ -425,7 +471,9 @@ impl YahooProvider {
         })?;
 
         Ok(Quote {
-            timestamp,
+            timestamp: exchange_timezone.map_or(timestamp, |timezone| {
+                Self::to_exchange_day(timestamp, timezone)
+            }),
             open: Decimal::from_f64_retain(yahoo_quote.open),
             high: Decimal::from_f64_retain(yahoo_quote.high),
             low: Decimal::from_f64_retain(yahoo_quote.low),
@@ -539,7 +587,7 @@ impl YahooProvider {
             MarketDataError::SymbolNotFound(symbol.to_string())
         })?;
 
-        self.yahoo_quote_to_quote(yahoo_quote, currency)
+        self.yahoo_quote_to_quote(yahoo_quote, currency, Self::exchange_timezone(context))
     }
 
     /// Fetch latest quote using backup method (quoteSummary API).
@@ -614,6 +662,9 @@ impl YahooProvider {
             .regular_market_time
             .and_then(|ts| Utc.timestamp_opt(ts, 0).single())
             .unwrap_or_else(Utc::now);
+        let timestamp = Self::exchange_timezone(context).map_or(timestamp, |timezone| {
+            Self::to_exchange_day(timestamp, timezone)
+        });
 
         Ok(Quote {
             timestamp,
@@ -1020,15 +1071,19 @@ impl MarketDataProvider for YahooProvider {
             .and_then(|m| m.currency)
             .unwrap_or_else(|| self.get_currency(context));
 
+        let exchange_timezone = Self::exchange_timezone(context);
+
         match response.quotes() {
             Ok(yahoo_quotes) => {
                 let quotes: Vec<Quote> = yahoo_quotes
                     .into_iter()
-                    .filter_map(|q| match self.yahoo_quote_to_quote(q, currency.clone()) {
-                        Ok(quote) => Some(quote),
-                        Err(e) => {
-                            warn!("Skipping quote due to conversion error: {:?}", e);
-                            None
+                    .filter_map(|q| {
+                        match self.yahoo_quote_to_quote(q, currency.clone(), exchange_timezone) {
+                            Ok(quote) => Some(quote),
+                            Err(e) => {
+                                warn!("Skipping quote due to conversion error: {:?}", e);
+                                None
+                            }
                         }
                     })
                     .collect();
@@ -1037,7 +1092,7 @@ impl MarketDataProvider for YahooProvider {
                     return Err(MarketDataError::NoDataForRange);
                 }
 
-                Ok(quotes)
+                Ok(Self::keep_last_quote_per_day(quotes))
             }
             Err(yahoo::YahooError::NoQuotes) => {
                 warn!(
@@ -1432,6 +1487,162 @@ mod tests {
             preferred_provider: None,
             bond_metadata: None,
             custom_provider_code: None,
+        }
+    }
+
+    fn utc(timestamp: &str) -> DateTime<Utc> {
+        timestamp.parse().expect("valid test timestamp")
+    }
+
+    fn create_equity_context(mic: Option<&'static str>) -> QuoteContext {
+        QuoteContext {
+            instrument: InstrumentId::Equity {
+                ticker: Arc::from("VAS"),
+                mic: mic.map(Cow::Borrowed),
+            },
+            identifiers: Default::default(),
+            overrides: None,
+            currency_hint: None,
+            preferred_provider: None,
+            bond_metadata: None,
+            custom_provider_code: None,
+        }
+    }
+
+    #[test]
+    fn test_to_exchange_day_moves_sydney_bar_to_session_day() {
+        assert_eq!(
+            YahooProvider::to_exchange_day(utc("2026-10-28T23:00:00Z"), Tz::Australia__Sydney),
+            utc("2026-10-29T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn test_to_exchange_day_keeps_same_day_live_quote_time() {
+        let live = utc("2026-10-30T05:10:11Z");
+        assert_eq!(
+            YahooProvider::to_exchange_day(live, Tz::Australia__Sydney),
+            live
+        );
+    }
+
+    #[test]
+    fn test_to_exchange_day_keeps_us_bar() {
+        let bar = utc("2026-10-29T13:30:00Z");
+        assert_eq!(
+            YahooProvider::to_exchange_day(bar, Tz::America__New_York),
+            bar
+        );
+    }
+
+    #[test]
+    fn test_to_exchange_day_keeps_sydney_bar_outside_daylight_saving() {
+        let bar = utc("2026-06-14T00:00:00Z");
+        assert_eq!(
+            YahooProvider::to_exchange_day(bar, Tz::Australia__Sydney),
+            bar
+        );
+    }
+
+    #[test]
+    fn test_to_exchange_day_moves_late_us_quote_back_without_reordering() {
+        // 20:30 in New York is already the next UTC day. It must stay after the day's bar.
+        let bar = utc("2026-10-29T13:30:00Z");
+        let late =
+            YahooProvider::to_exchange_day(utc("2026-10-30T00:30:00Z"), Tz::America__New_York);
+        assert_eq!(late, utc("2026-10-29T23:59:59Z"));
+        assert!(late > bar);
+    }
+
+    #[test]
+    fn test_to_exchange_day_matches_local_date_and_preserves_order() {
+        // The registry rejects reset history dated after the exchange's calendar date,
+        // so the normalised UTC date must equal the local date at every hour of a year,
+        // across daylight-saving changes.
+        for timezone in [
+            Tz::Australia__Sydney,
+            Tz::Pacific__Auckland,
+            Tz::Asia__Tokyo,
+            Tz::Europe__London,
+            Tz::America__New_York,
+        ] {
+            let mut previous: Option<DateTime<Utc>> = None;
+            for hour in 0..(365 * 24) {
+                let timestamp = utc("2026-01-01T00:00:00Z") + chrono::Duration::hours(hour);
+                let moved = YahooProvider::to_exchange_day(timestamp, timezone);
+
+                assert_eq!(
+                    moved.date_naive(),
+                    timestamp.with_timezone(&timezone).date_naive(),
+                    "{timezone} at {timestamp}"
+                );
+                assert!(
+                    previous.is_none_or(|earlier| moved >= earlier),
+                    "{timezone} reordered at {timestamp}"
+                );
+                previous = Some(moved);
+            }
+        }
+    }
+
+    #[test]
+    fn test_keep_last_quote_per_day_prefers_live_row_over_session_bar() {
+        let quote = |timestamp: DateTime<Utc>, close: Decimal| Quote {
+            timestamp,
+            open: None,
+            high: None,
+            low: None,
+            close,
+            volume: None,
+            currency: "AUD".to_string(),
+            source: "YAHOO".to_string(),
+        };
+        let earlier_bar = utc("2026-10-29T00:00:00Z");
+        // Yahoo's rows for the 30 Oct session: the bar at the open, then the live row.
+        let session_bar =
+            YahooProvider::to_exchange_day(utc("2026-10-29T23:00:00Z"), Tz::Australia__Sydney);
+        let live_row =
+            YahooProvider::to_exchange_day(utc("2026-10-30T05:10:11Z"), Tz::Australia__Sydney);
+
+        let quotes = YahooProvider::keep_last_quote_per_day(vec![
+            quote(earlier_bar, Decimal::new(10988, 2)),
+            quote(session_bar, Decimal::new(11000, 2)),
+            quote(live_row, Decimal::new(11003, 2)),
+        ]);
+
+        let kept: Vec<_> = quotes.iter().map(|q| (q.timestamp, q.close)).collect();
+        assert_eq!(
+            kept,
+            vec![
+                (earlier_bar, Decimal::new(10988, 2)),
+                (live_row, Decimal::new(11003, 2)),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_exchange_timezone_comes_from_equity_mic() {
+        assert_eq!(
+            YahooProvider::exchange_timezone(&create_equity_context(Some("XASX"))),
+            Some(Tz::Australia__Sydney)
+        );
+    }
+
+    #[test]
+    fn test_exchange_timezone_is_absent_without_a_known_exchange() {
+        for context in [
+            create_equity_context(None),
+            create_equity_context(Some("NOPE")),
+            create_test_fx_context(None, "USD"),
+            QuoteContext {
+                instrument: InstrumentId::Crypto {
+                    base: Arc::from("BTC"),
+                    quote: Cow::Borrowed("USD"),
+                },
+                ..create_equity_context(None)
+            },
+        ] {
+            assert_eq!(YahooProvider::exchange_timezone(&context), None);
         }
     }
 
